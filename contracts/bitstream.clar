@@ -83,3 +83,95 @@
     (>= (+ bal1 bal2) bal2)
   )
 )
+
+;;                      CHANNEL STATE REPOSITORY
+
+;; Comprehensive payment channel registry implementing UTXO-inspired transparency
+;; Each channel represents a cryptographically-secured escrow between two parties
+;; with Bitcoin-grade security guarantees and Lightning Network compatibility
+(define-map bitstream-channels
+  {
+    ;; Composite primary key preventing hash collisions
+    channel-id: (buff 32), ;; SHA256(pubkey1 || pubkey2 || nonce)
+    creator: principal, ;; Channel funding party (Stacks address)
+    participant: principal, ;; Channel receiving party (Stacks address)
+  }
+  {
+    ;; Channel economics and state tracking
+    total-liquidity: uint, ;; Combined channel capacity (microSTX)
+    creator-funds: uint, ;; Current creator balance allocation
+    participant-funds: uint, ;; Current participant balance allocation
+    operational-status: bool, ;; Active/inactive channel state
+    dispute-expiry: uint, ;; Bitcoin-anchored settlement deadline
+    version-counter: uint, ;; Anti-replay protection mechanism
+  }
+)
+
+;;                          UTILITY OPERATIONS
+
+;; Converts unsigned integers to consensus-compatible byte representation
+;; Essential for cross-chain message serialization and cryptographic commitments
+(define-private (encode-integer (value uint))
+  (unwrap-panic (to-consensus-buff? value))
+)
+
+;;                       CHANNEL ESTABLISHMENT
+
+;; Creates a new bidirectional payment channel with atomic fund locking
+;; Implements Bitcoin's security model with Stacks' programmable capabilities
+(define-public (create-payment-channel
+    (channel-id (buff 32))
+    (recipient principal)
+    (funding-amount uint)
+  )
+  (begin
+    ;; Multi-layer input validation ensuring protocol integrity
+    (asserts! (verify-channel-id channel-id) ERR_INVALID_INPUT)
+    (asserts! (verify-economic-viability funding-amount) ERR_INVALID_INPUT)
+    (asserts! (verify-safe-amount funding-amount) ERR_BALANCE_OVERFLOW)
+    (asserts! (verify-participant recipient) ERR_INVALID_ADDRESS)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_INPUT)
+
+    ;; Prevent channel duplication through unique constraint enforcement
+    (asserts!
+      (is-none (map-get? bitstream-channels {
+        channel-id: channel-id,
+        creator: tx-sender,
+        participant: recipient,
+      }))
+      ERR_CHANNEL_EXISTS
+    )
+
+    ;; Atomic fund commitment - STX locked in protocol-controlled escrow
+    ;; Funds become spendable only through cryptographically-authorized settlement
+    (try! (stx-transfer? funding-amount tx-sender (as-contract tx-sender)))
+
+    ;; Initialize channel with Bitcoin-compatible security parameters
+    (map-set bitstream-channels {
+      channel-id: channel-id,
+      creator: tx-sender,
+      participant: recipient,
+    } {
+      total-liquidity: funding-amount,
+      creator-funds: funding-amount,
+      participant-funds: u0,
+      operational-status: true,
+      dispute-expiry: u0,
+      version-counter: u0,
+    })
+
+    ;; Emit creation event for off-chain monitoring and Lightning integration
+    (print {
+      event-type: "channel-created",
+      channel-id: channel-id,
+      total-capacity: funding-amount,
+      parties: {
+        funding-party: tx-sender,
+        receiving-party: recipient,
+      },
+      block-height: stacks-block-height,
+    })
+
+    (ok true)
+  )
+)
