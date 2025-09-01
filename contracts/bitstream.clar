@@ -269,3 +269,95 @@
     (creator-authorization (buff 65))
     (recipient-authorization (buff 65))
   )
+  (let (
+      (channel-record (unwrap!
+        (map-get? bitstream-channels {
+          channel-id: channel-id,
+          creator: tx-sender,
+          participant: recipient,
+        })
+        ERR_CHANNEL_MISSING
+      ))
+      (total-channel-funds (get total-liquidity channel-record))
+    )
+    ;; Exhaustive input validation preventing malformed settlement attempts
+    (asserts! (verify-channel-id channel-id) ERR_INVALID_INPUT)
+    (asserts! (verify-participant recipient) ERR_INVALID_ADDRESS)
+    (asserts! (verify-signature-format creator-authorization) ERR_INVALID_INPUT)
+    (asserts! (verify-signature-format recipient-authorization) ERR_INVALID_INPUT)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_INPUT)
+
+    ;; Economic conservation law enforcement with overflow detection
+    (asserts!
+      (verify-balance-equation creator-final-balance recipient-final-balance
+        total-channel-funds
+      )
+      ERR_INSUFFICIENT_FUNDS
+    )
+
+    ;; Operational state verification - closed channels cannot be settled
+    (asserts! (get operational-status channel-record) ERR_CHANNEL_CLOSED)
+
+    ;; Generate cryptographic commitment representing final channel state
+    ;; This commitment must be signed by both parties to authorize settlement
+    (let ((settlement-message (concat (concat channel-id (encode-integer creator-final-balance))
+        (encode-integer recipient-final-balance)
+      )))
+      ;; Dual-signature verification ensuring both parties consent to settlement
+      (asserts!
+        (and
+          (verify-payment-authorization settlement-message creator-authorization
+            tx-sender
+          )
+          (verify-payment-authorization settlement-message
+            recipient-authorization recipient
+          )
+        )
+        ERR_SIGNATURE_INVALID
+      )
+
+      ;; Execute atomic fund distribution - both transfers succeed or transaction reverts
+      (try! (as-contract (stx-transfer? creator-final-balance tx-sender tx-sender)))
+      (try! (as-contract (stx-transfer? recipient-final-balance tx-sender recipient)))
+
+      ;; Permanently archive channel state to prevent future modifications
+      (map-set bitstream-channels {
+        channel-id: channel-id,
+        creator: tx-sender,
+        participant: recipient,
+      }
+        (merge channel-record {
+          operational-status: false,
+          creator-funds: u0,
+          participant-funds: u0,
+          total-liquidity: u0,
+        })
+      )
+
+      ;; Broadcast successful settlement for Lightning Network synchronization
+      (print {
+        event-type: "cooperative-settlement-completed",
+        channel-id: channel-id,
+        final-distribution: {
+          creator-amount: creator-final-balance,
+          recipient-amount: recipient-final-balance,
+        },
+        settlement-block: stacks-block-height,
+      })
+
+      (ok true)
+    )
+  )
+)
+
+;;                      DISPUTE RESOLUTION MECHANISM
+
+;; Initiates unilateral channel closure with Bitcoin-anchored dispute period
+;; Provides security against counterparty unresponsiveness or malicious behavior
+(define-public (initiate-unilateral-closure
+    (channel-id (buff 32))
+    (recipient principal)
+    (claimed-creator-balance uint)
+    (claimed-recipient-balance uint)
+    (state-authorization (buff 65))
+  )
