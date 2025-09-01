@@ -361,3 +361,97 @@
     (claimed-recipient-balance uint)
     (state-authorization (buff 65))
   )
+  (let (
+      (channel-record (unwrap!
+        (map-get? bitstream-channels {
+          channel-id: channel-id,
+          creator: tx-sender,
+          participant: recipient,
+        })
+        ERR_CHANNEL_MISSING
+      ))
+      (channel-total-value (get total-liquidity channel-record))
+    )
+    ;; Comprehensive input sanitization preventing malicious state claims
+    (asserts! (verify-channel-id channel-id) ERR_INVALID_INPUT)
+    (asserts! (verify-participant recipient) ERR_INVALID_ADDRESS)
+    (asserts! (verify-signature-format state-authorization) ERR_INVALID_INPUT)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_INPUT)
+
+    ;; Enforce balance conservation laws with comprehensive overflow checking
+    (asserts!
+      (verify-balance-equation claimed-creator-balance claimed-recipient-balance
+        channel-total-value
+      )
+      ERR_INSUFFICIENT_FUNDS
+    )
+
+    ;; Prevent operations on permanently closed channels
+    (asserts! (get operational-status channel-record) ERR_CHANNEL_CLOSED)
+
+    ;; Construct state commitment hash for cryptographic verification
+    ;; This represents the claimant's assertion of the current channel state
+    (let ((state-commitment (concat (concat channel-id (encode-integer claimed-creator-balance))
+        (encode-integer claimed-recipient-balance)
+      )))
+      ;; Verify claimant's cryptographic authorization of the disputed state
+      (asserts!
+        (verify-payment-authorization state-commitment state-authorization
+          tx-sender
+        )
+        ERR_SIGNATURE_INVALID
+      )
+
+      ;; Activate Bitcoin-synchronized dispute window (144 blocks = 24 hours)
+      ;; This period allows the counterparty to challenge fraudulent state claims
+      (map-set bitstream-channels {
+        channel-id: channel-id,
+        creator: tx-sender,
+        participant: recipient,
+      }
+        (merge channel-record {
+          dispute-expiry: (+ stacks-block-height u144),
+          creator-funds: claimed-creator-balance,
+          participant-funds: claimed-recipient-balance,
+        })
+      )
+
+      ;; Signal dispute initiation for off-chain monitoring systems
+      (print {
+        event-type: "dispute-period-activated",
+        channel-id: channel-id,
+        expiry-height: (+ stacks-block-height u144),
+        disputed-balances: {
+          creator-claim: claimed-creator-balance,
+          recipient-claim: claimed-recipient-balance,
+        },
+        challenge-window: u144,
+      })
+
+      (ok true)
+    )
+  )
+)
+
+;; Completes disputed settlement after timelock expiration
+;; Implements Bitcoin's CSV (CheckSequenceVerify) timelock semantics
+(define-public (complete-disputed-settlement
+    (channel-id (buff 32))
+    (recipient principal)
+  )
+  (let (
+      (channel-record (unwrap!
+        (map-get? bitstream-channels {
+          channel-id: channel-id,
+          creator: tx-sender,
+          participant: recipient,
+        })
+        ERR_CHANNEL_MISSING
+      ))
+      (creator-payout (get creator-funds channel-record))
+      (recipient-payout (get participant-funds channel-record))
+    )
+    ;; Standard input validation for settlement finalization
+    (asserts! (verify-channel-id channel-id) ERR_INVALID_INPUT)
+    (asserts! (verify-participant recipient) ERR_INVALID_ADDRESS)
+    (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_INPUT)
