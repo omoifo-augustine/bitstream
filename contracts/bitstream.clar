@@ -455,3 +455,93 @@
     (asserts! (verify-channel-id channel-id) ERR_INVALID_INPUT)
     (asserts! (verify-participant recipient) ERR_INVALID_ADDRESS)
     (asserts! (not (is-eq tx-sender recipient)) ERR_INVALID_INPUT)
+
+    ;; Enforce Bitcoin-style timelock semantics - dispute period must be complete
+    (asserts! (>= stacks-block-height (get dispute-expiry channel-record))
+      ERR_TIMELOCK_ACTIVE
+    )
+
+    ;; Execute final fund distribution according to disputed state
+    (try! (as-contract (stx-transfer? creator-payout tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? recipient-payout tx-sender recipient)))
+
+    ;; Permanently deactivate channel preventing future state modifications
+    (map-set bitstream-channels {
+      channel-id: channel-id,
+      creator: tx-sender,
+      participant: recipient,
+    }
+      (merge channel-record {
+        operational-status: false,
+        creator-funds: u0,
+        participant-funds: u0,
+        total-liquidity: u0,
+      })
+    )
+
+    ;; Emit settlement completion event for ecosystem integration
+    (print {
+      event-type: "dispute-settlement-finalized",
+      channel-id: channel-id,
+      final-payouts: {
+        creator-received: creator-payout,
+        recipient-received: recipient-payout,
+      },
+      completion-height: stacks-block-height,
+    })
+
+    (ok true)
+  )
+)
+
+;;                       LIGHTNING NETWORK INTERFACE
+
+;; Public channel state query for Lightning Network routing and monitoring
+;; Enables seamless integration with existing Bitcoin payment infrastructure
+(define-read-only (get-channel-information
+    (channel-id (buff 32))
+    (creator principal)
+    (participant principal)
+  )
+  ;; Input validation for read operations preventing invalid queries
+  (if (and
+      (verify-channel-id channel-id)
+      (verify-participant creator)
+      (verify-participant participant)
+      (not (is-eq creator participant))
+    )
+    (map-get? bitstream-channels {
+      channel-id: channel-id,
+      creator: creator,
+      participant: participant,
+    })
+    none
+  )
+)
+
+;;                        EMERGENCY PROTOCOLS
+
+;; Administrative circuit breaker for critical security vulnerabilities
+;; Provides last-resort fund recovery mechanism while maintaining transparency
+(define-public (emergency-fund-recovery)
+  (begin
+    ;; Restrict emergency powers to protocol administrator only
+    (asserts! (is-eq tx-sender PROTOCOL_ADMIN) ERR_ACCESS_DENIED)
+
+    ;; Transfer all protocol-held assets to administrative control
+    ;; This function serves as protection against unforeseen smart contract bugs
+    (try! (stx-transfer? (stx-get-balance (as-contract tx-sender))
+      (as-contract tx-sender) PROTOCOL_ADMIN
+    ))
+
+    ;; Document emergency intervention for audit trails and transparency
+    (print {
+      event-type: "emergency-recovery-executed",
+      authorized-by: PROTOCOL_ADMIN,
+      execution-height: stacks-block-height,
+      intervention-reason: "critical-security-protocol",
+    })
+
+    (ok true)
+  )
+)
